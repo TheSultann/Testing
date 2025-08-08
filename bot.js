@@ -1,368 +1,311 @@
 const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
+const express =require('express');
+const cron = require('node-cron');
 const config = require('./config');
-const utils = require('./utils'); // Теперь импортируем checkAccess
+const utils = require('./utils');
 const db = require('./db');
 const keyboards = require('./keyboards');
 
-// --- Инициализация HTTP-сервера ---
+// --- Инициализация ---
 const app = express();
 const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is running'));
 app.listen(port, () => console.log(`Server running on port ${port}`));
 
-// --- Инициализация бота ---
 const bot = new TelegramBot(config.token, { polling: true });
-console.log('Бот запущен (из bot.js)...');
+console.log('Бот запущен...');
 
-// --- Хранилище состояния диалога ---
 let userState = {};
-
-// --- Инициализация состояния пользователя ---
 function initializeUserState(chatId) {
     if (!userState[chatId]) {
         userState[chatId] = { action: null, data: {} };
     }
 }
 
-// --- Обработчики команд и сообщений ---
+// --- ОБНОВЛЕННАЯ ФУНКЦИЯ ГЕНЕРАЦИИ ОТЧЕТА ---
+async function generateAndSendReport(chatId, startDate, endDate, messageId = null, isScheduled = false) {
+    const periodTitle = startDate === endDate ? `за ${startDate}` : `за период с ${startDate} по ${endDate}`;
+    const reportHeader = isScheduled ? `Автоматический отчет ${periodTitle}` : `Статистика ${periodTitle}`;
+    
+    console.log(`[${chatId}] Запрос статистики ${periodTitle}`);
+    if (messageId) {
+        await bot.editMessageText(`⏳ Загружаю статистику ${periodTitle}...`, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(e => console.warn(e.message));
+    } else {
+        bot.sendChatAction(chatId, 'typing');
+    }
 
-// /start
+    const stats = await db.getStatsForPeriod(chatId, startDate, endDate);
+    if (!stats) {
+        bot.sendMessage(chatId, `❌ Не удалось получить статистику ${periodTitle}.`, keyboards.mainKeyboard);
+        return;
+    }
+
+    let report = `📊 ${reportHeader}:\n\n`;
+    config.pieTypes.forEach(type => {
+        const pieStat = stats.pies[type] || { manufactured: 0, sold: 0, revenue: 0, price: stats.prices[type] || 0, written_off: 0, loss: 0 };
+        report += `"${type}" (цена: ${utils.formatNumber(pieStat.price)} ${config.currencySymbol}):\n`;
+        report += `- Изготовлено: ${utils.formatNumber(pieStat.manufactured)}\n`;
+        report += `- Продано: ${utils.formatNumber(pieStat.sold)} шт.\n`;
+        if (pieStat.written_off > 0) {
+            report += `- Списано: ${utils.formatNumber(pieStat.written_off)} шт. (потеря: ${utils.formatNumber(pieStat.loss)} ${config.currencySymbol})\n`;
+        }
+        report += `- Выручка (${type}): ${utils.formatNumber(pieStat.revenue)} ${config.currencySymbol}.\n\n`;
+    });
+    report += `Общая выручка: ${utils.formatNumber(stats.totalRevenue)} ${config.currencySymbol}.\n`;
+    if (stats.lossFromWriteOff > 0) {
+        report += `🗑️ Потери от списаний: ${utils.formatNumber(stats.lossFromWriteOff)} ${config.currencySymbol}.\n`;
+    }
+    report += `💸 Расходы за период: ${utils.formatNumber(stats.expenses)} ${config.currencySymbol}.\n`;
+    report += `📈 Чистая прибыль: ${utils.formatNumber(stats.profit)} ${config.currencySymbol}.\n`;
+
+    await bot.sendMessage(chatId, report, keyboards.mainKeyboard);
+}
+
+// --- Обработчики команд и сообщений ---
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
-    // --- Проверка доступа для /start ---
     if (!utils.checkAccess(chatId)) {
-        // console.log(`[${chatId}] Отказ в доступе (команда /start).`); // Лог уже есть в checkAccess
         bot.sendMessage(chatId, '⛔ У вас нет доступа к этому боту.');
-        return; // Прекращаем обработку
+        return;
     }
-    // --- КОНЕЦ Проверки ---
-
     initializeUserState(chatId);
-    console.log(`[${chatId}] Получена команда /start`);
     bot.sendMessage(chatId, 'Привет! Я помогу тебе вести учет пирожков. Выбери действие:', keyboards.mainKeyboard);
 });
 
-// Обработка текстовых сообщений (кнопки и ввод данных)
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    // --- Проверка доступа для ВСЕХ сообщений (кроме /start) ---
-    if (!utils.checkAccess(chatId)) {
-        // console.log(`[${chatId}] Отказ в доступе (сообщение: "${text}").`); // Лог уже есть в checkAccess
-        // Не отвечаем ничего, чтобы не спамить неавторизованным
-        return; // Прекращаем обработку
-    }
-    // --- КОНЕЦ Проверки ---
-
-    if (!text) { console.log(`[${chatId}] Получено нетекстовое сообщение.`); return; }
+    if (!utils.checkAccess(chatId) || !text || text.startsWith('/')) return;
 
     initializeUserState(chatId);
     const state = userState[chatId];
     console.log(`[${chatId}] Текст: "${text}" | Состояние: ${state?.action || 'нет'}`);
 
     // 1. Обработка состояний ввода
-    if (state && state.action === 'awaiting_pie_quantity') {
-        const quantity = parseInt(text, 10);
-        if (isNaN(quantity) || quantity <= 0) {
-            bot.sendMessage(chatId, '❌ Пожалуйста, введи корректное число (больше нуля).'); return;
-        }
-        const pieType = state.data.type;
-        console.log(`[${chatId}] Введено количество ${quantity} для "${pieType}". Вызов RPC...`);
-        bot.sendChatAction(chatId, 'typing');
-        const newTotal = await db.addManufacturedToDb(chatId, pieType, quantity);
-        if (newTotal !== null) {
-            bot.sendMessage(chatId, `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего изготовлено "${pieType}" сегодня: ${utils.formatNumber(newTotal)}.`, keyboards.mainKeyboard);
-        } else {
-            bot.sendMessage(chatId, `❌ Ошибка при сохранении данных об изготовленных "${pieType}". Попробуйте позже.`, keyboards.mainKeyboard);
-        }
-        userState[chatId] = { action: null, data: {} };
-        return;
-
-    } else if (state && state.action === 'awaiting_remaining_input') {
-        const quantity = parseInt(text, 10);
-        const pieType = state.data.pieType;
-        const manufacturedCount = state.data.manufactured;
-        if (isNaN(quantity) || quantity < 0) {
-            bot.sendMessage(chatId, `❌ Введи корректное число (0 или больше) для остатка "${pieType}".`); return;
-        }
-        if (quantity > manufacturedCount) {
-             bot.sendMessage(chatId, `❌ Ошибка: остаток (${utils.formatNumber(quantity)}) не может быть больше, чем изготовлено (${utils.formatNumber(manufacturedCount)}) для "${pieType}".\nПопробуй ввести остаток еще раз:`); return;
-        }
-        console.log(`[${chatId}] Введен остаток ${quantity} для "${pieType}". Сохранение в БД...`);
-        bot.sendChatAction(chatId, 'typing');
-        const success = await db.saveRemainingToDb(chatId, pieType, quantity);
-        if (success) {
-            bot.sendMessage(chatId, `👍 Записан остаток для "${pieType}": ${utils.formatNumber(quantity)}.`);
-            userState[chatId] = { action: null, data: {} };
-            try {
-                const remainingKeyboard = await keyboards.createRemainingKeyboard(chatId);
-                await bot.sendMessage(chatId, 'Выбери следующий пирожок или вернись назад:', remainingKeyboard);
-            } catch(e) {
-                 console.error(`[${chatId}] Ошибка при показе клавиатуры остатков после ввода:`, e);
-                 bot.sendMessage(chatId, 'Не удалось обновить меню ввода остатков.', keyboards.mainKeyboard);
+    if (state && state.action) {
+        // ... (существующие case'ы без изменений)
+        switch (state.action) {
+            case 'awaiting_pie_quantity': {
+                const quantity = parseInt(text, 10);
+                if (isNaN(quantity) || quantity <= 0) { bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).'); return; }
+                const pieType = state.data.type;
+                const newTotal = await db.addManufacturedToDb(chatId, pieType, quantity);
+                bot.sendMessage(chatId, newTotal !== null ? `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего сегодня: ${utils.formatNumber(newTotal)}.` : `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                userState[chatId] = { action: null, data: {} };
+                return;
             }
-        } else {
-             bot.sendMessage(chatId, `❌ Ошибка при сохранении остатка "${pieType}". Попробуйте позже.`, keyboards.mainKeyboard);
-             userState[chatId] = { action: null, data: {} };
+            case 'awaiting_remaining_input': {
+                const quantity = parseInt(text, 10);
+                const { pieType, manufactured } = state.data;
+                if (isNaN(quantity) || quantity < 0) { bot.sendMessage(chatId, `❌ Введите корректное число (0 или больше).`); return; }
+                if (quantity > manufactured) { bot.sendMessage(chatId, `❌ Остаток (${quantity}) не может быть больше изготовленного (${manufactured}).`); return; }
+                const success = await db.saveRemainingToDb(chatId, pieType, quantity);
+                if (success) {
+                    bot.sendMessage(chatId, `👍 Записан остаток для "${pieType}": ${utils.formatNumber(quantity)}.`);
+                    userState[chatId] = { action: null, data: {} };
+                    await bot.sendMessage(chatId, 'Выбери следующий пирожок или вернись назад:', await keyboards.createRemainingKeyboard(chatId));
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка сохранения остатка.`, keyboards.mainKeyboard);
+                    userState[chatId] = { action: null, data: {} };
+                }
+                return;
+            }
+            // --- НОВЫЙ CASE ДЛЯ СПИСАНИЙ ---
+            case 'awaiting_write_off_quantity': {
+                const quantity = parseInt(text, 10);
+                const { pieType, remaining } = state.data;
+                if (isNaN(quantity) || quantity <= 0) {
+                    bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).'); return;
+                }
+                if (quantity > remaining) {
+                    bot.sendMessage(chatId, `❌ Количество для списания (${quantity}) не может быть больше остатка (${remaining}). Попробуйте еще раз.`); return;
+                }
+                const result = await db.processWriteOffInDb(chatId, pieType, quantity);
+                if (result.success) {
+                    bot.sendMessage(chatId, `✅ Успешно списано ${quantity} шт. "${pieType}".`);
+                    userState[chatId] = { action: null, data: {} };
+                    await bot.sendMessage(chatId, 'Выберите следующую продукцию для списания:', await keyboards.createWriteOffKeyboard(chatId));
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка при списании: ${result.message}`, keyboards.mainKeyboard);
+                    userState[chatId] = { action: null, data: {} };
+                }
+                return;
+            }
+            // ... (остальные case'ы без изменений)
+            case 'awaiting_expenses_input': {
+                const amount = parseFloat(text.replace(',', '.'));
+                if (isNaN(amount) || amount < 0) { bot.sendMessage(chatId, '❌ Введите корректную сумму.'); return; }
+                const newTotal = await db.saveExpensesToDb(chatId, amount);
+                bot.sendMessage(chatId, newTotal !== null ? `✅ Расходы (${utils.formatNumber(amount)}) добавлены. Общие за сегодня: ${utils.formatNumber(newTotal)} ${config.currencySymbol}.` : `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                userState[chatId] = { action: null, data: {} };
+                return;
+            }
+            case 'awaiting_price_input': {
+                const price = parseFloat(text.replace(',', '.'));
+                const { type } = state.data;
+                if (isNaN(price) || price < 0) { bot.sendMessage(chatId, '❌ Введите корректную цену.'); return; }
+                const success = await db.savePriceToDb(chatId, type, price);
+                bot.sendMessage(chatId, success ? `✅ Цена для "${type}" установлена: ${utils.formatNumber(price)} ${config.currencySymbol}.` : `❌ Ошибка сохранения.`);
+                userState[chatId] = { action: null, data: {} };
+                await bot.sendMessage(chatId, 'Текущие настройки цен:', await keyboards.createSettingsKeyboard(chatId));
+                return;
+            }
+            case 'awaiting_custom_start_date': {
+                if (!utils.isValidDate(text)) { bot.sendMessage(chatId, '❌ Неверный формат. Введите ГГГГ-ММ-ДД:'); return; }
+                userState[chatId] = { action: 'awaiting_custom_end_date', data: { startDate: text } };
+                bot.sendMessage(chatId, '✅ Отлично. Теперь введите дату конца (ГГГГ-ММ-ДД):');
+                return;
+            }
+            case 'awaiting_custom_end_date': {
+                if (!utils.isValidDate(text)) { bot.sendMessage(chatId, '❌ Неверный формат. Введите ГГГГ-ММ-ДД:'); return; }
+                const { startDate } = state.data;
+                if (new Date(text) < new Date(startDate)) { bot.sendMessage(chatId, '❌ Дата конца не может быть раньше даты начала.'); return; }
+                userState[chatId] = { action: null, data: {} };
+                await generateAndSendReport(chatId, startDate, text);
+                return;
+            }
         }
-        return;
-
-    } else if (state && state.action === 'awaiting_expenses_input') {
-        const amount = parseFloat(text.replace(',', '.'));
-        if (isNaN(amount) || amount < 0) {
-            bot.sendMessage(chatId, '❌ Введи корректную сумму расходов (число, 0 или больше).'); return;
-        }
-        console.log(`[${chatId}] Введены расходы ${amount}. Вызов RPC...`);
-        bot.sendChatAction(chatId, 'typing');
-        const newTotalExpenses = await db.saveExpensesToDb(chatId, amount);
-        if (newTotalExpenses !== null) {
-            bot.sendMessage(chatId, `✅ Расходы (${utils.formatNumber(amount)}) добавлены. Общие расходы за сегодня: ${utils.formatNumber(newTotalExpenses)} ${config.currencySymbol}.`, keyboards.mainKeyboard);
-        } else {
-            bot.sendMessage(chatId, `❌ Ошибка при сохранении расходов. Попробуйте позже.`, keyboards.mainKeyboard);
-        }
-        userState[chatId] = { action: null, data: {} };
-        return;
-
-    } else if (state && state.action === 'awaiting_price_input') {
-        const price = parseFloat(text.replace(',', '.'));
-        const pieType = state.data.type;
-        if (isNaN(price) || price < 0) {
-             bot.sendMessage(chatId, '❌ Введи корректную цену (число, 0 или больше).'); return;
-        }
-        console.log(`[${chatId}] Введена цена ${price} для "${pieType}". Сохранение в БД...`);
-        bot.sendChatAction(chatId, 'typing');
-        const success = await db.savePriceToDb(chatId, pieType, price);
-        if (success) {
-            bot.sendMessage(chatId, `✅ Цена для пирожков "${pieType}" установлена: ${utils.formatNumber(price)} ${config.currencySymbol}.`);
-        } else {
-            bot.sendMessage(chatId, `❌ Ошибка при сохранении цены для "${pieType}". Попробуйте позже.`);
-        }
-        userState[chatId] = { action: null, data: {} };
-        try {
-            const settingsKeyboard = await keyboards.createSettingsKeyboard(chatId);
-            bot.sendMessage(chatId, 'Текущие настройки цен:', settingsKeyboard);
-        } catch (e) {
-            console.error(`[${chatId}] Ошибка при показе клавиатуры настроек после ввода цены:`, e);
-            bot.sendMessage(chatId, 'Не удалось обновить меню настроек.', keyboards.mainKeyboard);
-        }
-        return;
     }
 
-    // 2. Обработка кнопок главного меню (если не активно состояние ввода)
-    console.log(`[${chatId}] Обработка кнопки главного меню: "${text}"`);
+    // 2. Обработка кнопок главного меню
     switch (text) {
         case '➕ Добавить изготовленные пирожки':
             bot.sendMessage(chatId, 'Какой тип пирожков изготовили?', keyboards.pieTypesKeyboard);
             break;
         case '📦 Ввести остатки':
-            bot.sendChatAction(chatId, 'typing');
-            try {
-                const remainingKeyboard = await keyboards.createRemainingKeyboard(chatId);
-                await bot.sendMessage(chatId, 'Для какого пирожка ввести/изменить остаток?', remainingKeyboard);
-            } catch (e) {
-                 console.error(`[${chatId}] Ошибка при показе клавиатуры ввода остатков:`, e);
-                 bot.sendMessage(chatId, '❌ Не удалось загрузить меню ввода остатков.', keyboards.mainKeyboard);
-            }
+            bot.sendMessage(chatId, 'Для какого пирожка ввести/изменить остаток?', await keyboards.createRemainingKeyboard(chatId));
+            break;
+        // --- НОВАЯ КНОПКА ---
+        case '🗑️ Списать продукцию':
+            bot.sendMessage(chatId, 'Выберите продукцию для списания (с остатком > 0):', await keyboards.createWriteOffKeyboard(chatId));
             break;
         case '💰 Ввести расходы':
             userState[chatId] = { action: 'awaiting_expenses_input', data: {} };
-            bot.sendMessage(chatId, `Введи сумму расходов в ${config.currencySymbol}, которую нужно ДОБАВИТЬ к сегодняшним (например, 50000 или 12500.50):`);
+            bot.sendMessage(chatId, `Введите сумму расходов в ${config.currencySymbol}:`);
             break;
         case '📊 Посмотреть статистику':
-            console.log(`[${chatId}] Нажата кнопка Статистика, показываем выбор периода.`);
-            try {
-                 await bot.sendMessage(chatId, 'Выберите период для статистики:', keyboards.statsPeriodKeyboard);
-            } catch (e) {
-                 console.error(`[${chatId}] Ошибка при показе клавиатуры выбора периода статистики:`, e);
-                 bot.sendMessage(chatId, '❌ Не удалось показать выбор периода.', keyboards.mainKeyboard);
-            }
+            bot.sendMessage(chatId, 'Выберите период для статистики:', keyboards.statsPeriodKeyboard);
             break;
         case '🛠 Настройки':
-            bot.sendChatAction(chatId, 'typing');
-             try {
-                const settingsKeyboard = await keyboards.createSettingsKeyboard(chatId);
-                await bot.sendMessage(chatId, '⚙️ Настройки цен на пирожки:', settingsKeyboard);
-            } catch (e) {
-                console.error(`[${chatId}] Ошибка при показе клавиатуры настроек:`, e);
-                bot.sendMessage(chatId, '❌ Не удалось загрузить меню настроек.', keyboards.mainKeyboard);
-            }
+            bot.sendMessage(chatId, '⚙️ Настройки цен на пирожки:', await keyboards.createSettingsKeyboard(chatId));
             break;
         default:
-             console.log(`[${chatId}] Неизвестный текст/команда: "${text}"`);
-             break;
+            console.log(`[${chatId}] Неизвестный текст/команда: "${text}"`);
+            break;
     }
 });
 
-// Обработка нажатий инлайн-кнопок
+// Обработка инлайн-кнопок
 bot.on('callback_query', async (callbackQuery) => {
     const msg = callbackQuery.message;
     const chatId = msg.chat.id;
     const data = callbackQuery.data;
 
-    // --- Проверка доступа для ВСЕХ callback'ов ---
     if (!utils.checkAccess(chatId)) {
-        // console.log(`[${chatId}] Отказ в доступе (callback: ${data}).`); // Лог уже есть в checkAccess
         bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ У вас нет доступа.', show_alert: true });
-        return; // Прекращаем обработку
+        return;
     }
-    // --- КОНЕЦ Проверки ---
 
     initializeUserState(chatId);
     console.log(`[${chatId}] Callback: ${data}`);
+    
+    const hideKeyboard = async () => {
+        try { await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msg.message_id }); }
+        catch (e) { await bot.deleteMessage(chatId, msg.message_id).catch(err => console.warn(err.message)); }
+    };
 
-    // Обработка выбора периода статистики
-    if (data.startsWith('stats_period_')) {
-        const periodType = data.substring('stats_period_'.length);
-        let startDate, endDate;
-        let periodTitle = '';
-        const today = new Date();
-        endDate = utils.getCurrentDate();
-
-        if (periodType === 'today') {
-            startDate = endDate;
-            periodTitle = 'за сегодня';
-        } else if (periodType === 'week') {
-            const weekAgo = new Date();
-            weekAgo.setDate(today.getDate() - 6);
-            startDate = weekAgo.toISOString().split('T')[0];
-            periodTitle = 'за неделю';
-        } else if (periodType === 'month') {
-            const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-            startDate = firstDayOfMonth.toISOString().split('T')[0];
-            periodTitle = 'за этот месяц';
-        } else {
-            console.warn(`[${chatId}] Неизвестный тип периода статистики: ${periodType}`);
-            bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестный период' }); return;
-        }
-
-        console.log(`[${chatId}] Запрос статистики ${periodTitle} (${startDate} - ${endDate})`);
-        bot.sendChatAction(chatId, 'typing');
-        try {
-             await bot.editMessageText(`⏳ Загружаю статистику ${periodTitle}...`, { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-        } catch (e) { console.warn(`[${chatId}] Не удалось изменить сообщение выбора периода: ${e.message}`); }
-
-        const stats = await db.getStatsForPeriod(chatId, startDate, endDate);
-
-        if (!stats) {
-             bot.sendMessage(chatId, `❌ Не удалось получить статистику ${periodTitle}. Проверьте логи.`, keyboards.mainKeyboard); return;
-        }
-
-        let report = `📊 Статистика ${periodTitle} (${startDate} - ${endDate}):\n\n`;
-        config.pieTypes.forEach(type => {
-                const pieStat = stats.pies[type] || { manufactured: 0, sold: 0, revenue: 0, price: stats.prices[type] || 0 };
-                report += `"${type}" (цена: ${utils.formatNumber(pieStat.price)} ${config.currencySymbol}):\n`;
-                report += `- Изготовлено: ${utils.formatNumber(pieStat.manufactured)}\n`;
-                report += `- Продано: ${utils.formatNumber(pieStat.sold)} шт.\n`;
-                report += `- Выручка (${type}): ${utils.formatNumber(pieStat.revenue)} ${config.currencySymbol}.\n\n`;
-            });
-        report += `Общая выручка: ${utils.formatNumber(stats.totalRevenue)} ${config.currencySymbol}.\n`;
-        report += `💸 Расходы за период: ${utils.formatNumber(stats.expenses)} ${config.currencySymbol}.\n`;
-        report += `📈 Чистая прибыль: ${utils.formatNumber(stats.profit)} ${config.currencySymbol}.\n`;
-
-        bot.sendMessage(chatId, report, keyboards.mainKeyboard);
-        bot.answerCallbackQuery(callbackQuery.id);
-
-    } else if (data === 'back_to_main_from_stats') {
-         console.log(`[${chatId}] Нажата кнопка Назад из меню статистики`);
-         try {
-             await bot.deleteMessage(chatId, msg.message_id);
-         } catch (e) { console.warn(`[${chatId}] Не удалось удалить/изменить сообщение при возврате из статистики: ${e.message}`); }
-         bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
-         bot.answerCallbackQuery(callbackQuery.id);
-
-    // Обработка ввода остатков
-    } else if (data.startsWith('enter_remaining_')) {
-        const pieType = data.substring('enter_remaining_'.length);
-        console.log(`[${chatId}] Нажата кнопка ввода остатка для "${pieType}"`);
-        bot.sendChatAction(chatId, 'typing');
+    // --- Обработка списаний ---
+    if (data.startsWith('write_off_')) {
+        const pieType = data.substring('write_off_'.length);
         const logEntry = await db.getDailyLogEntry(chatId, pieType);
-        const manufacturedCount = logEntry.manufactured;
+        const remainingCount = logEntry.remaining || 0;
 
-        if (manufacturedCount <= 0) {
-            console.warn(`[${chatId}] Попытка ввести остаток для "${pieType}", но manufactured=0`);
-            bot.answerCallbackQuery(callbackQuery.id, { text: `Пирожки "${pieType}" сегодня не изготовлены.` });
-            try {
-                const kbd = await keyboards.createRemainingKeyboard(chatId);
-                await bot.editMessageReplyMarkup(kbd.reply_markup, { chat_id: chatId, message_id: msg.message_id });
-            } catch (e) { console.error("Ошибка обновления KBD после 'не изготовлено'", e); }
+        if (remainingCount <= 0) {
+            bot.answerCallbackQuery(callbackQuery.id, { text: `У "${pieType}" нет остатка для списания.`, show_alert: true });
+            await bot.editMessageReplyMarkup((await keyboards.createWriteOffKeyboard(chatId)).reply_markup, { chat_id: chatId, message_id: msg.message_id });
             return;
         }
-        userState[chatId] = { action: 'awaiting_remaining_input', data: { pieType: pieType, manufactured: manufacturedCount } };
-        const previousRemaining = (logEntry.remaining !== null && logEntry.remaining !== undefined) ? ` (ранее введено: ${utils.formatNumber(logEntry.remaining)})` : '';
-        try {
-             await bot.editMessageText(
-                 `Сколько осталось пирожков "${pieType}"? (Изготовлено: ${utils.formatNumber(manufacturedCount)}${previousRemaining}) Введи число:`,
-                 { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }
-             );
-        } catch (e) {
-            console.warn(`[${chatId}] Не удалось изменить сообщение для ввода остатка ${pieType}: ${e.message}. Отправляю новое.`);
-            bot.sendMessage(chatId, `Сколько осталось пирожков "${pieType}"? (Изготовлено: ${utils.formatNumber(manufacturedCount)}${previousRemaining}) Введи число:`);
+        userState[chatId] = { action: 'awaiting_write_off_quantity', data: { pieType, remaining: remainingCount } };
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько списать пирожков "${pieType}"? (В остатке: ${remainingCount}) Введите число:`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    
+    // ... (существующие обработчики callback'ов)
+    if (data.startsWith('stats_period_')) {
+        const periodType = data.substring('stats_period_'.length);
+        if (periodType === 'custom') {
+            userState[chatId] = { action: 'awaiting_custom_start_date', data: {} };
+            await hideKeyboard();
+            bot.sendMessage(chatId, '✍️ Введите дату начала периода (ГГГГ-ММ-ДД):');
+        } else {
+            let startDate, endDate = utils.getCurrentDate();
+            if (periodType === 'today') startDate = endDate;
+            else if (periodType === 'week') { const d = new Date(); d.setDate(d.getDate() - 6); startDate = d.toISOString().split('T')[0]; }
+            else if (periodType === 'month') { const d = new Date(); startDate = new Date(d.getFullYear(), d.getMonth(), 1).toISOString().split('T')[0]; }
+            else { return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестный период' }); }
+            await generateAndSendReport(chatId, startDate, endDate, msg.message_id);
         }
-        bot.answerCallbackQuery(callbackQuery.id);
-
-    } else if (data === 'back_to_main_from_remaining' || data === 'no_pies_for_remaining') {
-         console.log(`[${chatId}] Нажата кнопка Назад из меню остатков`);
-         try {
-             await bot.editMessageText('Возвращаемся в главное меню...', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-         } catch (e) { console.warn(`[${chatId}] Не удалось изменить сообщение при возврате из остатков: ${e.message}`); }
-         bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
-         bot.answerCallbackQuery(callbackQuery.id);
-
-    // Обработка добавления изготовленных
+        return bot.answerCallbackQuery(callbackQuery.id);
     } else if (data.startsWith('add_pie_')) {
         const pieType = data.substring('add_pie_'.length);
-        console.log(`[${chatId}] Нажата кнопка добавления "${pieType}"`);
         userState[chatId] = { action: 'awaiting_pie_quantity', data: { type: pieType } };
-        try {
-            await bot.editMessageText(`Сколько пирожков "${pieType}" изготовили? Введи число:`, { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-        } catch (e) {
-             console.warn(`[${chatId}] Не удалось изменить сообщение для ввода кол-ва ${pieType}: ${e.message}. Отправляю новое.`);
-             bot.sendMessage(chatId, `Сколько пирожков "${pieType}" изготовили? Введи число:`);
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько пирожков "${pieType}" изготовили?`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('enter_remaining_')) {
+        const pieType = data.substring('enter_remaining_'.length);
+        const logEntry = await db.getDailyLogEntry(chatId, pieType);
+        const manufacturedCount = logEntry.manufactured || 0;
+        if (manufacturedCount <= 0) {
+            bot.answerCallbackQuery(callbackQuery.id, { text: `"${pieType}" сегодня не изготовлены.` });
+            await bot.editMessageReplyMarkup((await keyboards.createRemainingKeyboard(chatId)).reply_markup, { chat_id: chatId, message_id: msg.message_id });
+            return;
         }
-        bot.answerCallbackQuery(callbackQuery.id);
-
-    } else if (data === 'back_to_main_from_add') {
-         console.log(`[${chatId}] Нажата кнопка Назад из меню добавления`);
-         try {
-             await bot.editMessageText('Возвращаемся в главное меню...', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-         } catch (e) { console.warn(`[${chatId}] Не удалось изменить сообщение при возврате из добавления: ${e.message}`); }
-         bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
-         bot.answerCallbackQuery(callbackQuery.id);
-
-    // Обработка настроек
+        userState[chatId] = { action: 'awaiting_remaining_input', data: { pieType, manufactured: manufacturedCount } };
+        const prevRem = (logEntry.remaining !== null) ? ` (ранее: ${logEntry.remaining})` : '';
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько осталось "${pieType}"? (Изготовлено: ${manufacturedCount}${prevRem})`);
+        return bot.answerCallbackQuery(callbackQuery.id);
     } else if (data.startsWith('set_price_')) {
         const pieType = data.substring('set_price_'.length);
-        console.log(`[${chatId}] Нажата кнопка установки цены для "${pieType}"`);
         userState[chatId] = { action: 'awaiting_price_input', data: { type: pieType } };
-        try {
-            await bot.editMessageText(`Введи новую цену для пирожков "${pieType}" в ${config.currencySymbol} (например, 15000 или 8500.50):`, { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-        } catch (e) {
-             console.warn(`[${chatId}] Не удалось изменить сообщение для ввода цены ${pieType}: ${e.message}. Отправляю новое.`);
-             bot.sendMessage(chatId, `Введи новую цену для пирожков "${pieType}" в ${config.currencySymbol} (например, 15000 или 8500.50):`);
-        }
-        bot.answerCallbackQuery(callbackQuery.id);
-
-    } else if (data === 'back_to_main_from_settings') {
-         console.log(`[${chatId}] Нажата кнопка Назад из меню настроек`);
-         try {
-             await bot.editMessageText('Возвращаемся в главное меню...', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
-         } catch (e) { console.warn(`[${chatId}] Не удалось изменить сообщение при возврате из настроек: ${e.message}`); }
-         bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
-         bot.answerCallbackQuery(callbackQuery.id);
-
-    // Неизвестный callback
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Введите новую цену для "${pieType}" в ${config.currencySymbol}:`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('back_to_main_') || data.startsWith('no_pies_for_')) {
+        await bot.deleteMessage(chatId, msg.message_id).catch(e => console.warn(e.message));
+        bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
+        return bot.answerCallbackQuery(callbackQuery.id);
     } else {
-        console.warn(`[${chatId}] Получен неизвестный callback_data: ${data}`);
-        bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестное действие' });
+        console.warn(`[${chatId}] Неизвестный callback: ${data}`);
+        return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестное действие' });
     }
 });
 
+// --- ПЛАНИРОВЩИК И ОБРАБОТКА ОШИБОК ---
+if (cron.validate(config.REPORT_SCHEDULE)) {
+    cron.schedule(config.REPORT_SCHEDULE, async () => {
+        console.log(`[CRON] Запуск ежедневного отчета...`);
+        const today = utils.getCurrentDate();
+        const chatIds = config.ALLOWED_CHAT_IDS.split(',').map(id => id.trim());
+        for (const chatId of chatIds) {
+            try {
+                console.log(`[CRON] Отправка отчета пользователю ${chatId}`);
+                await generateAndSendReport(chatId, today, today, null, true);
+                await new Promise(resolve => setTimeout(resolve, 500));
+            } catch (error) {
+                console.error(`[CRON] Не удалось отправить отчет ${chatId}:`, error.message);
+            }
+        }
+        console.log(`[CRON] Отправка завершена.`);
+    }, { scheduled: true, timezone: config.REPORT_TIMEZONE });
+    console.log(`Авто-отчет запланирован на ${config.REPORT_SCHEDULE} (Timezone: ${config.REPORT_TIMEZONE})`);
+} else {
+    console.error(`!!! ОШИБКА: Неверный формат cron-строки: "${config.REPORT_SCHEDULE}"`);
+}
 
-// --- Обработка ошибок ---
-bot.on('polling_error', (error) => { console.error(`[Polling Error] ${error.code}: ${error.message}`); });
-bot.on('webhook_error', (error) => { console.error(`[Webhook Error] ${error.code}: ${error.message}`); });
-bot.on("error", (err) => { console.error("[General Bot Error]", err); });
-process.on('uncaughtException', (error, origin) => { console.error(`\nНеперехваченное исключение: ${error}`, `Источник: ${origin}`); });
-process.on('unhandledRejection', (reason, promise) => { console.error('Необработанный reject:', promise, `Причина: ${reason}`); });
+bot.on('polling_error', (e) => console.error(`[Polling Error] ${e.message}`));
+process.on('uncaughtException', (e, o) => console.error(`Неперехваченное исключение: ${e}`, o));
+process.on('unhandledRejection', (r, p) => console.error('Необработанный reject:', p, `Причина: ${r}`));
