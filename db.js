@@ -20,7 +20,6 @@ async function savePriceToDb(chatId, pieType, price) {
 
 // --- Функции для ежедневных логов ---
 async function addManufacturedToDb(chatId, pieType, quantity) {
-    // 1. Вызываем RPC для обновления данных в БД.
     const { data: rpcData, error: rpcError } = await supabase.rpc('upsert_daily_manufactured', {
         p_chat_id: chatId,
         p_pie_type: pieType,
@@ -31,15 +30,10 @@ async function addManufacturedToDb(chatId, pieType, quantity) {
         console.error(`[${chatId}] Ошибка RPC upsert_daily_manufactured:`, rpcError.message);
         return null;
     }
-
-    // 2. Сразу после обновления принудительно запрашиваем свежие данные из таблицы,
-    // чтобы гарантировать получение правильного итогового количества.
     const updatedLogEntry = await getDailyLogEntry(chatId, pieType);
-
-    // 3. Формируем корректный объект для ответа, который ожидает bot.js
     return {
-        new_total: updatedLogEntry.manufactured, // Используем свежеполученное значение
-        remaining_reset: rpcData?.remaining_reset || false // Сохраняем флаг сброса остатков из ответа RPC
+        new_total: updatedLogEntry.manufactured,
+        remaining_reset: rpcData?.remaining_reset || false
     };
 }
 
@@ -180,24 +174,45 @@ async function getSalesAnalysis(chatId, startDate, endDate) {
     return data;
 }
 
-async function getWeekdayAnalysis(chatId, startDate, endDate) {
-    const { data, error } = await supabase.rpc('get_weekday_sales_analysis', {
+// ========= ИЗМЕНЕННАЯ ФУНКЦИЯ =========
+async function getAverageWeekdayAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_average_weekday_sales', { // Вызываем новую SQL-функцию
         p_chat_id: chatId,
         p_start_date: startDate.toISOString().split('T')[0],
         p_end_date: endDate.toISOString().split('T')[0]
     });
     if (error) {
-        console.error(`[${chatId}] Ошибка RPC get_weekday_sales_analysis:`, error.message);
+        console.error(`[${chatId}] Ошибка RPC get_average_weekday_sales:`, error.message);
+        return null;
+    }
+    return data;
+}
+
+
+async function getSalesDataForAI(chatId) {
+    const { data, error } = await supabase.rpc('get_sales_data_for_ai', {
+        p_chat_id: chatId
+    });
+
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC get_sales_data_for_ai:`, error.message);
         return null;
     }
     return data;
 }
 
 module.exports = {
-    getPricesFromDb, savePriceToDb, addManufacturedToDb, getDailyLogEntry,
-    getTodaysLogsGrouped, saveRemainingToDb, saveExpensesToDb, getStatsForPeriod,
+    getPricesFromDb,
+    savePriceToDb,
+    addManufacturedToDb,
+    getDailyLogEntry,
+    getTodaysLogsGrouped,
+    saveRemainingToDb,
+    saveExpensesToDb,
+    getStatsForPeriod,
     processWriteOffInDb,
     getProfitabilityAnalysis,
     getSalesAnalysis,
-    getWeekdayAnalysis
+    getAverageWeekdayAnalysis, // Экспортируем новую функцию
+    getSalesDataForAI
 };

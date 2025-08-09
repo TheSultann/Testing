@@ -110,6 +110,7 @@ const analyticsTypeKeyboard = {
             [{ text: '🏆 Самый прибыльный пирожок', callback_data: 'analytics_most_profitable' }],
             [{ text: '📈 Самый продаваемый пирожок', callback_data: 'analytics_most_sold' }],
             [{ text: '📅 Анализ по дням недели', callback_data: 'analytics_weekday' }],
+            [{ text: '🤖 AI Прогноз спроса', callback_data: 'analytics_ai_forecast' }],
             [{ text: '🔙 Назад в статистику', callback_data: 'back_to_stats_menu' }]
         ]
     }

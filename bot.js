@@ -5,6 +5,7 @@ const config = require('./config');
 const utils = require('./utils');
 const db = require('./db');
 const keyboards = require('./keyboards');
+const gemini = require('./gemini_service');
 
 // --- Инициализация ---
 const app = express();
@@ -97,7 +98,6 @@ bot.on('message', async (msg) => {
                 if (result) {
                     let message = `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего сегодня: ${utils.formatNumber(result.new_total)}.`;
                     
-                    // ИЗМЕНЕНО: Проверяем флаг сброса остатков и информируем пользователя
                     if (result.remaining_reset) {
                         message += `\n\n⚠️ **Внимание!** Вы добавили новую партию, поэтому старый остаток был сброшен для точности расчетов. Введите итоговый остаток в конце дня.`;
                     }
@@ -253,13 +253,14 @@ bot.on('callback_query', async (callbackQuery) => {
         const startDate = new Date();
         startDate.setDate(endDate.getDate() - 29); // Последние 30 дней
         
-        const periodText = `Аналитический срез за период с ${startDate.toISOString().split('T')[0]} по ${endDate.toISOString().split('T')[0]}`;
+        const periodText = `за период с ${startDate.toISOString().split('T')[0]} по ${endDate.toISOString().split('T')[0]}`;
         let report = '';
+        let parseMode = 'Markdown';
 
         switch(analyticsType) {
             case 'most_profitable': {
                 const results = await db.getProfitabilityAnalysis(chatId, startDate, endDate);
-                report = `🏆 ${periodText}\n\n*Рейтинг по выручке:*\n\n`;
+                report = `🏆 Рейтинг по выручке ${periodText}:\n\n`;
                 if (!results || results.length === 0) {
                     report += 'Нет данных для анализа.';
                 } else {
@@ -271,7 +272,7 @@ bot.on('callback_query', async (callbackQuery) => {
             }
             case 'most_sold': {
                 const results = await db.getSalesAnalysis(chatId, startDate, endDate);
-                report = `📈 ${periodText}\n\n*Рейтинг по количеству продаж:*\n\n`;
+                report = `📈 Рейтинг по количеству продаж ${periodText}:\n\n`;
                  if (!results || results.length === 0) {
                     report += 'Нет данных для анализа.';
                 } else {
@@ -281,31 +282,48 @@ bot.on('callback_query', async (callbackQuery) => {
                 }
                 break;
             }
+            // ========= ИЗМЕНЕННЫЙ БЛОК =========
             case 'weekday': {
-                const results = await db.getWeekdayAnalysis(chatId, startDate, endDate);
-                report = `📅 ${periodText}\n\n*Самый продаваемый пирожок по дням недели:*\n\n`;
+                const results = await db.getAverageWeekdayAnalysis(chatId, startDate, endDate);
+                report = `📅 Средние продажи по дням недели ${periodText}:\n\n`;
                 if (!results || results.length === 0) {
-                    report += 'Нет данных для анализа.';
+                    report += 'Нет данных для анализа. Убедитесь, что вы вводили остатки за прошедшие дни.';
                 } else {
-                    const dayMap = { 1: 'Пн', 2: 'Вт', 3: 'Ср', 4: 'Чт', 5: 'Пт', 6: 'Сб', 7: 'Вс' };
+                    const dayMap = { 1: 'Понедельник', 2: 'Вторник', 3: 'Среда', 4: 'Четверг', 5: 'Пятница', 6: 'Суббота', 7: 'Воскресенье' };
                     
                     const groupedByDay = results.reduce((acc, item) => {
-                        if (!acc[item.day_of_week_iso]) {
-                            acc[item.day_of_week_iso] = { pies: [], quantity: item.total_sold_quantity };
+                        const day = item.day_of_week_iso;
+                        if (!acc[day]) {
+                            acc[day] = [];
                         }
-                        acc[item.day_of_week_iso].pies.push(`"${item.pie_type}"`);
+                        acc[day].push(`- ${item.pie_type}: ${item.avg_sold_quantity} шт.`);
                         return acc;
                     }, {});
 
-                    Object.keys(groupedByDay).sort().forEach(day_iso => {
-                        const dayData = groupedByDay[day_iso];
-                        const dayName = dayMap[day_iso] || '??';
-                        const pieNames = dayData.pies.join(', ');
-                        const quantityText = dayData.pies.length > 1 ? `(продано по ${utils.formatNumber(dayData.quantity)} шт.)` : `(продано ${utils.formatNumber(dayData.quantity)} шт.)`;
-                        
-                        report += `*${dayName}*: ${pieNames} ${quantityText}\n`;
-                    });
+                    for (const day_iso in dayMap) {
+                         if (groupedByDay[day_iso]) {
+                            report += `*${dayMap[day_iso]}:*\n`;
+                            report += groupedByDay[day_iso].join('\n');
+                            report += '\n\n';
+                        }
+                    }
                 }
+                break;
+            }
+            case 'ai_forecast': {
+                await bot.editMessageText(
+                    '🤖 Искусственный интеллект анализирует данные... Это может занять до 30 секунд.', 
+                    { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }
+                );
+                
+                const salesData = await db.getSalesDataForAI(chatId);
+                
+                if (!salesData) {
+                    report = '❌ Не удалось получить данные для анализа. Попробуйте позже.';
+                } else {
+                    report = await gemini.getProductionForecast(salesData);
+                }
+                parseMode = undefined;
                 break;
             }
         }
@@ -313,7 +331,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.editMessageText(report, {
             chat_id: chatId,
             message_id: msg.message_id,
-            parse_mode: 'Markdown',
+            parse_mode: parseMode,
             reply_markup: keyboards.analyticsTypeKeyboard.reply_markup
         });
         return bot.answerCallbackQuery(callbackQuery.id);
