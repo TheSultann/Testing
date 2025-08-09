@@ -1,7 +1,7 @@
 const { supabase, pieTypes } = require('./config');
 const { getCurrentDate } = require('./utils');
 
-// --- Функции получения/сохранения цен (без изменений) ---
+// --- Функции получения/сохранения цен ---
 async function getPricesFromDb(chatId) {
     const { data, error } = await supabase.from('chat_settings').select('pie_type, price').eq('chat_id', chatId);
     if (error) {
@@ -20,10 +20,29 @@ async function savePriceToDb(chatId, pieType, price) {
 
 // --- Функции для ежедневных логов ---
 async function addManufacturedToDb(chatId, pieType, quantity) {
-    const { data, error } = await supabase.rpc('upsert_daily_manufactured', { p_chat_id: chatId, p_pie_type: pieType, p_add_quantity: quantity });
-    if (error) { console.error(`[${chatId}] Ошибка RPC upsert_daily_manufactured:`, error.message); return null; }
-    return data;
+    // 1. Вызываем RPC для обновления данных в БД.
+    const { data: rpcData, error: rpcError } = await supabase.rpc('upsert_daily_manufactured', {
+        p_chat_id: chatId,
+        p_pie_type: pieType,
+        p_add_quantity: quantity
+    });
+
+    if (rpcError) {
+        console.error(`[${chatId}] Ошибка RPC upsert_daily_manufactured:`, rpcError.message);
+        return null;
+    }
+
+    // 2. Сразу после обновления принудительно запрашиваем свежие данные из таблицы,
+    // чтобы гарантировать получение правильного итогового количества.
+    const updatedLogEntry = await getDailyLogEntry(chatId, pieType);
+
+    // 3. Формируем корректный объект для ответа, который ожидает bot.js
+    return {
+        new_total: updatedLogEntry.manufactured, // Используем свежеполученное значение
+        remaining_reset: rpcData?.remaining_reset || false // Сохраняем флаг сброса остатков из ответа RPC
+    };
 }
+
 
 async function getDailyLogEntry(chatId, pieType) {
     const { data, error } = await supabase.from('daily_log').select('manufactured, remaining, written_off').eq('chat_id', chatId).eq('log_date', getCurrentDate()).eq('pie_type', pieType).maybeSingle();
@@ -65,7 +84,6 @@ async function saveExpensesToDb(chatId, amountToAdd) {
     return data;
 }
 
-// --- НОВАЯ ФУНКЦИЯ ДЛЯ СПИСАНИЙ ---
 async function processWriteOffInDb(chatId, pieType, quantity) {
     const { data, error } = await supabase.rpc('process_write_off', {
         p_chat_id: chatId,
@@ -74,7 +92,6 @@ async function processWriteOffInDb(chatId, pieType, quantity) {
     });
     if (error) {
         console.error(`[${chatId}] Ошибка RPC process_write_off:`, error.message);
-        // Возвращаем сообщение об ошибке для пользователя
         const userFriendlyMessage = error.message.includes('не может быть больше остатка') ?
             'Количество для списания превышает остаток.' :
             'Произошла ошибка в базе данных.';
@@ -84,9 +101,8 @@ async function processWriteOffInDb(chatId, pieType, quantity) {
     return { success: true, newTotal: data };
 }
 
-// --- ОБНОВЛЕННАЯ ФУНКЦИЯ СТАТИСТИКИ (с учетом списаний) ---
+// --- Функция для статистики ---
 async function getStatsForPeriod(chatId, startDate, endDate) {
-    console.log(`[${chatId}] Запрос статистики (списания) через RPC: ${startDate} - ${endDate}`);
     const prices = await getPricesFromDb(chatId);
     const { data: aggregatedData, error } = await supabase.rpc('get_aggregated_stats', { p_chat_id: chatId, p_start_date: startDate, p_end_date: endDate });
 
@@ -124,12 +140,9 @@ async function getStatsForPeriod(chatId, startDate, endDate) {
         const lossForType = totalWrittenOffForType > 0 ? totalWrittenOffForType * price : 0;
         
         stats.pies[type] = {
-            manufactured: totalManufactured,
-            sold: totalSold,
-            written_off: totalWrittenOffForType,
-            revenue: revenueForType,
-            price: price,
-            loss: lossForType
+            manufactured: totalManufactured, sold: totalSold,
+            written_off: totalWrittenOffForType, revenue: revenueForType,
+            price: price, loss: lossForType
         };
         stats.totalRevenue += revenueForType;
         stats.totalWrittenOff += totalWrittenOffForType;
@@ -137,12 +150,54 @@ async function getStatsForPeriod(chatId, startDate, endDate) {
     }
 
     stats.profit = stats.totalRevenue - stats.expenses - stats.lossFromWriteOff;
-    console.log(`[${chatId}] Статистика успешно подсчитана (включая списания).`);
     return stats;
+}
+
+// --- Функции для Аналитики ---
+async function getProfitabilityAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_profitability_ranking', {
+        p_chat_id: chatId,
+        p_start_date: startDate.toISOString().split('T')[0],
+        p_end_date: endDate.toISOString().split('T')[0]
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC get_profitability_ranking:`, error.message);
+        return null;
+    }
+    return data;
+}
+
+async function getSalesAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_sales_ranking', {
+        p_chat_id: chatId,
+        p_start_date: startDate.toISOString().split('T')[0],
+        p_end_date: endDate.toISOString().split('T')[0]
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC get_sales_ranking:`, error.message);
+        return null;
+    }
+    return data;
+}
+
+async function getWeekdayAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_weekday_sales_analysis', {
+        p_chat_id: chatId,
+        p_start_date: startDate.toISOString().split('T')[0],
+        p_end_date: endDate.toISOString().split('T')[0]
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC get_weekday_sales_analysis:`, error.message);
+        return null;
+    }
+    return data;
 }
 
 module.exports = {
     getPricesFromDb, savePriceToDb, addManufacturedToDb, getDailyLogEntry,
     getTodaysLogsGrouped, saveRemainingToDb, saveExpensesToDb, getStatsForPeriod,
-    processWriteOffInDb // Экспортируем новую функцию
+    processWriteOffInDb,
+    getProfitabilityAnalysis,
+    getSalesAnalysis,
+    getWeekdayAnalysis
 };

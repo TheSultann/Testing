@@ -22,11 +22,11 @@ function initializeUserState(chatId) {
     }
 }
 
-// --- ОБНОВЛЕННАЯ ФУНКЦИЯ ГЕНЕРАЦИИ ОТЧЕТА ---
+// --- ФУНКЦИЯ ГЕНЕРАЦИИ ОТЧЕТА ---
 async function generateAndSendReport(chatId, startDate, endDate, messageId = null, isScheduled = false) {
     const periodTitle = startDate === endDate ? `за ${startDate}` : `за период с ${startDate} по ${endDate}`;
     const reportHeader = isScheduled ? `Автоматический отчет ${periodTitle}` : `Статистика ${periodTitle}`;
-    
+
     console.log(`[${chatId}] Запрос статистики ${periodTitle}`);
     if (messageId) {
         await bot.editMessageText(`⏳ Загружаю статистику ${periodTitle}...`, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(e => console.warn(e.message));
@@ -84,14 +84,30 @@ bot.on('message', async (msg) => {
 
     // 1. Обработка состояний ввода
     if (state && state.action) {
-        // ... (существующие case'ы без изменений)
         switch (state.action) {
             case 'awaiting_pie_quantity': {
                 const quantity = parseInt(text, 10);
-                if (isNaN(quantity) || quantity <= 0) { bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).'); return; }
+                if (isNaN(quantity) || quantity <= 0) {
+                    bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).');
+                    return;
+                }
                 const pieType = state.data.type;
-                const newTotal = await db.addManufacturedToDb(chatId, pieType, quantity);
-                bot.sendMessage(chatId, newTotal !== null ? `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего сегодня: ${utils.formatNumber(newTotal)}.` : `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                const result = await db.addManufacturedToDb(chatId, pieType, quantity);
+
+                if (result) {
+                    let message = `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего сегодня: ${utils.formatNumber(result.new_total)}.`;
+                    
+                    // ИЗМЕНЕНО: Проверяем флаг сброса остатков и информируем пользователя
+                    if (result.remaining_reset) {
+                        message += `\n\n⚠️ **Внимание!** Вы добавили новую партию, поэтому старый остаток был сброшен для точности расчетов. Введите итоговый остаток в конце дня.`;
+                    }
+                    bot.sendMessage(chatId, message, {
+                        ...keyboards.mainKeyboard,
+                        parse_mode: 'Markdown'
+                    });
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                }
                 userState[chatId] = { action: null, data: {} };
                 return;
             }
@@ -111,7 +127,6 @@ bot.on('message', async (msg) => {
                 }
                 return;
             }
-            // --- НОВЫЙ CASE ДЛЯ СПИСАНИЙ ---
             case 'awaiting_write_off_quantity': {
                 const quantity = parseInt(text, 10);
                 const { pieType, remaining } = state.data;
@@ -132,7 +147,6 @@ bot.on('message', async (msg) => {
                 }
                 return;
             }
-            // ... (остальные case'ы без изменений)
             case 'awaiting_expenses_input': {
                 const amount = parseFloat(text.replace(',', '.'));
                 if (isNaN(amount) || amount < 0) { bot.sendMessage(chatId, '❌ Введите корректную сумму.'); return; }
@@ -176,7 +190,6 @@ bot.on('message', async (msg) => {
         case '📦 Ввести остатки':
             bot.sendMessage(chatId, 'Для какого пирожка ввести/изменить остаток?', await keyboards.createRemainingKeyboard(chatId));
             break;
-        // --- НОВАЯ КНОПКА ---
         case '🗑️ Списать продукцию':
             bot.sendMessage(chatId, 'Выберите продукцию для списания (с остатком > 0):', await keyboards.createWriteOffKeyboard(chatId));
             break;
@@ -185,7 +198,7 @@ bot.on('message', async (msg) => {
             bot.sendMessage(chatId, `Введите сумму расходов в ${config.currencySymbol}:`);
             break;
         case '📊 Посмотреть статистику':
-            bot.sendMessage(chatId, 'Выберите период для статистики:', keyboards.statsPeriodKeyboard);
+            bot.sendMessage(chatId, 'Выберите период для статистики или откройте аналитику:', keyboards.statsPeriodKeyboard);
             break;
         case '🛠 Настройки':
             bot.sendMessage(chatId, '⚙️ Настройки цен на пирожки:', await keyboards.createSettingsKeyboard(chatId));
@@ -215,7 +228,6 @@ bot.on('callback_query', async (callbackQuery) => {
         catch (e) { await bot.deleteMessage(chatId, msg.message_id).catch(err => console.warn(err.message)); }
     };
 
-    // --- Обработка списаний ---
     if (data.startsWith('write_off_')) {
         const pieType = data.substring('write_off_'.length);
         const logEntry = await db.getDailyLogEntry(chatId, pieType);
@@ -232,7 +244,99 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.answerCallbackQuery(callbackQuery.id);
     }
     
-    // ... (существующие обработчики callback'ов)
+    if (data.startsWith('analytics_')) {
+        const analyticsType = data.substring('analytics_'.length);
+        const loadingText = '⏳ Анализирую данные...';
+        await bot.editMessageText(loadingText, { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }).catch(e => console.warn(e.message));
+
+        const endDate = new Date();
+        const startDate = new Date();
+        startDate.setDate(endDate.getDate() - 29); // Последние 30 дней
+        
+        const periodText = `Аналитический срез за период с ${startDate.toISOString().split('T')[0]} по ${endDate.toISOString().split('T')[0]}`;
+        let report = '';
+
+        switch(analyticsType) {
+            case 'most_profitable': {
+                const results = await db.getProfitabilityAnalysis(chatId, startDate, endDate);
+                report = `🏆 ${periodText}\n\n*Рейтинг по выручке:*\n\n`;
+                if (!results || results.length === 0) {
+                    report += 'Нет данных для анализа.';
+                } else {
+                    results.forEach((item, index) => {
+                        report += `${index + 1}. "${item.pie_type}": ${utils.formatNumber(item.total_revenue)} ${config.currencySymbol}\n`;
+                    });
+                }
+                break;
+            }
+            case 'most_sold': {
+                const results = await db.getSalesAnalysis(chatId, startDate, endDate);
+                report = `📈 ${periodText}\n\n*Рейтинг по количеству продаж:*\n\n`;
+                 if (!results || results.length === 0) {
+                    report += 'Нет данных для анализа.';
+                } else {
+                    results.forEach((item, index) => {
+                        report += `${index + 1}. "${item.pie_type}": продано ${utils.formatNumber(item.total_sold_quantity)} шт.\n`;
+                    });
+                }
+                break;
+            }
+            case 'weekday': {
+                const results = await db.getWeekdayAnalysis(chatId, startDate, endDate);
+                report = `📅 ${periodText}\n\n*Самый продаваемый пирожок по дням недели:*\n\n`;
+                if (!results || results.length === 0) {
+                    report += 'Нет данных для анализа.';
+                } else {
+                    const dayMap = { 1: 'Пн', 2: 'Вт', 3: 'Ср', 4: 'Чт', 5: 'Пт', 6: 'Сб', 7: 'Вс' };
+                    
+                    const groupedByDay = results.reduce((acc, item) => {
+                        if (!acc[item.day_of_week_iso]) {
+                            acc[item.day_of_week_iso] = { pies: [], quantity: item.total_sold_quantity };
+                        }
+                        acc[item.day_of_week_iso].pies.push(`"${item.pie_type}"`);
+                        return acc;
+                    }, {});
+
+                    Object.keys(groupedByDay).sort().forEach(day_iso => {
+                        const dayData = groupedByDay[day_iso];
+                        const dayName = dayMap[day_iso] || '??';
+                        const pieNames = dayData.pies.join(', ');
+                        const quantityText = dayData.pies.length > 1 ? `(продано по ${utils.formatNumber(dayData.quantity)} шт.)` : `(продано ${utils.formatNumber(dayData.quantity)} шт.)`;
+                        
+                        report += `*${dayName}*: ${pieNames} ${quantityText}\n`;
+                    });
+                }
+                break;
+            }
+        }
+        
+        await bot.editMessageText(report, {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            parse_mode: 'Markdown',
+            reply_markup: keyboards.analyticsTypeKeyboard.reply_markup
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+
+    if (data === 'show_analytics_menu') {
+        await bot.editMessageText('🧠 Аналитика\n\nВыберите тип отчета. Расчет будет произведен за последние 30 дней.', {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reply_markup: keyboards.analyticsTypeKeyboard.reply_markup
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    
+    if (data === 'back_to_stats_menu') {
+        await bot.editMessageText('Выберите период для статистики или откройте аналитику:', {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reply_markup: keyboards.statsPeriodKeyboard.reply_markup
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    
     if (data.startsWith('stats_period_')) {
         const periodType = data.substring('stats_period_'.length);
         if (periodType === 'custom') {
